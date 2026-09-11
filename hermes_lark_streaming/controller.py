@@ -489,8 +489,37 @@ class StreamCardController(StreamingController):
         task_name: str = "",
         run_time: str = "",
     ) -> bool:
-        """Cron 推送 — 包装为静态卡片发送，成功返回 True."""
+        """Cron 推送 — 包装为静态卡片发送，成功返回 True.
+
+        SILENT_SKIP_PATCH: 2026-07-31 主人选 P1, plugin 不再推 SILENT cron
+        If the cron job's LLM emitted [SILENT] (no anomaly to report),
+        return False so we don't push a card with `:Alarm:` header + empty
+        body — that's owner noise, not a signal. See
+        ~/.hermes/skills/hermes/cron-silent-push-fix/SKILL.md for the
+        full diagnosis chain and rollout procedure.
+        """
         if not self.enabled or not content or not chat_id:
+            return False
+        # SILENT_SKIP_PATCH: skip [SILENT] / [SILENT\n / empty / whitespace-only content
+        # 2026-08-01 主人报 17:42 静默 cron 仍推飞书: Response 含描述 + [SILENT\n
+        # 用 "in" 替代 startswith, 同时检查每行 (LLM 可能 "[SILENT\n" 单独成行, 也可能
+        # 整段都是 SILENT, 也可能 SILENT 跟其他文字粘一起). 用正则也覆盖空/单 token.
+        import re
+        _stripped = content.strip()
+        _is_silent = False
+        if not _stripped:
+            _is_silent = True
+        elif _stripped.upper() in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]"):
+            _is_silent = True
+        elif re.search(r"\bSILENT\b", _stripped.upper()):
+            # 抓 "SILENT" 单词 (含 [SILENT] / SILENT / [SILENT)
+            _is_silent = True
+        if _is_silent:
+            _logger.info(
+                "cron card skipped (silent): task=%s chat=%s len=%d preview=%r",
+                task_name or "<none>", chat_id[:12], len(content),
+                _stripped[:80],
+            )
             return False
         coroutine = self._do_cron_deliver(
             chat_id, content, task_name=task_name, run_time=run_time

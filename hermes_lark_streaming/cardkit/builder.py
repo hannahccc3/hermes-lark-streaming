@@ -550,7 +550,28 @@ def _format_run_time(run_time: str) -> str:
 def build_cron_card(
     content: str, *, task_name: str = "", run_time: str = ""
 ) -> dict[str, Any]:
-    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容."""
+    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容.
+
+    SILENT_SKIP_PATCH: 2026-07-31 主人选 P1
+    Defense in depth — even if on_cron_deliver is bypassed (e.g. someone
+    calls build_cron_card directly from a test, or future code paths),
+    refuse to build a card for empty/SILENT content. Returning {} signals
+    "don't send" to whichever caller is invoking this.
+    """
+    # SILENT_SKIP_PATCH: empty / SILENT content → return {} so caller skips push
+    # 2026-08-01 主人报 17:42 静默 cron 仍推飞书: Response 含描述 + [SILENT\n
+    # 用 "in" 替代 startswith, 同时正则抓 \bSILENT\b (整段 SILENT / [SILENT] / 跟其他文字粘一起)
+    import re
+    _stripped = (content or "").strip()
+    _is_silent = False
+    if not _stripped:
+        _is_silent = True
+    elif _stripped.upper() in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]"):
+        _is_silent = True
+    elif re.search(r"\bSILENT\b", _stripped.upper()):
+        _is_silent = True
+    if _is_silent:
+        return {}
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "locales": _LOCALES},

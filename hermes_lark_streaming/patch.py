@@ -298,7 +298,26 @@ def on_cron_deliver(
     task_name: str = "",
     run_time: str = "",
 ) -> bool:
-    """[注入点 10] cron 推送 — 包装为飞书卡片发送."""
+    """[注入点 10] cron 推送 — 包装为飞书卡片发送.
+
+    SILENT_BLOCKER_V3: suppress a silent cron before controller/loop handling.
+    The scheduler fallback can send raw text if a card controller is unavailable;
+    therefore this guard must sit at the patch entry point, not only in the
+    CardKit builder or controller.
+    """
+    # SILENT_BLOCKER_V3: hard-stop before any controller / loop / fallback.
+    import re as _re_silent_v3
+    _stripped = (content or "").strip()
+    if not _stripped:
+        _logger.info("cron card skipped (silent, empty): task=%s chat=%s", task_name or "<none>", chat_id[:12])
+        return False
+    _upper = _stripped.upper()
+    if _upper in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]", "[NO_REPLY]", "[NO REPLY]"):
+        _logger.info("cron card skipped (silent, marker): task=%s chat=%s body=%r", task_name or "<none>", chat_id[:12], _stripped[:80])
+        return False
+    if _re_silent_v3.search(r"\bSILENT\b", _upper):
+        _logger.info("cron card skipped (silent, regex): task=%s chat=%s body=%r", task_name or "<none>", chat_id[:12], _stripped[:80])
+        return False
     try:
         ctrl = get_controller()
         if not ctrl.enabled:

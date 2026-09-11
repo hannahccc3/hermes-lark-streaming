@@ -551,6 +551,12 @@ def _interrupt_hook(indent: str) -> str:
 
 
 def _cron_deliver_hook(indent: str) -> str:
+    """Inject a SILENT guard before lark cron delivery (defense in depth).
+
+    SILENT_BLOCKER_V3: If a silent result reaches the scheduler, acknowledge
+    its target and continue before scheduler's plain-text fallback can send an
+    empty `:Alarm:` card to Feishu.
+    """
     return _make_hook(
         indent,
         MK_CRON_DELIVER,
@@ -561,6 +567,19 @@ def _cron_deliver_hook(indent: str) -> str:
             "        platform_name.lower() in ('feishu', 'lark')",
             "        and not getattr(locals().get('transport'), 'is_relay', False)",
             "    ):",
+            "        # SILENT_BLOCKER_V3: scheduler-level guard, before fallback delivery.",
+            "        import re as _re_silent_hook",
+            "        _sil_stripped = (cleaned_delivery_content or '').strip()",
+            "        _sil_upper = _sil_stripped.upper()",
+            "        _sil_silent = (",
+            "            not _sil_stripped",
+            "            or _sil_upper in ('SILENT','NO_REPLY','NO REPLY','[SILENT]','[NO_REPLY]','[NO REPLY]')",
+            "            or bool(_re_silent_hook.search(r'\\bSILENT\\b', _sil_upper))",
+            "        )",
+            "        if _sil_silent:",
+            "            # Mark consumed and skip the built-in Feishu delivery path; no card is built.",
+            "            delivered = True",
+            "            continue",
             "        if '_hermes_lark_cron_seen' not in locals():",
             "            _hermes_lark_cron_seen = set()",
             "        _hermes_lark_cron_key = (str(chat_id), cleaned_delivery_content.strip())",
@@ -573,7 +592,7 @@ def _cron_deliver_hook(indent: str) -> str:
             "            content=cleaned_delivery_content.strip(),",
             "            loop=loop,",
             "            task_name=job.get('name', ''),",
-            "            run_time=job.get('next_run_at', ''),",
+            "            run_time=datetime.now(timezone.utc).astimezone().isoformat(timespec='minutes'),",
             "        ):",
             "            _hermes_lark_cron_seen.add(_hermes_lark_cron_key)",
             "            delivered = True",
