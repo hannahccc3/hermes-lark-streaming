@@ -491,8 +491,24 @@ class StreamCardController(StreamingController):
         task_name: str = "",
         run_time: str = "",
     ) -> bool:
-        """Cron 推送 — 包装为静态卡片发送，成功返回 True."""
+        """Cron 推送 — 包装为静态卡片发送，成功返回 True.
+
+        SILENT_SKIP_PATCH: [SILENT]/empty content → return False, 不推卡.
+        See ~/.hermes/skills/hermes/cron-silent-push-fix/SKILL.md.
+        """
         if not self.enabled or not content or not chat_id:
+            return False
+        # SILENT_SKIP_PATCH: skip [SILENT] / empty / whitespace-only content
+        import re
+        _stripped = content.strip()
+        _is_silent = False
+        if not _stripped:
+            _is_silent = True
+        elif _stripped.upper() in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]"):
+            _is_silent = True
+        elif re.search(r"\bSILENT\b", _stripped.upper()):
+            _is_silent = True
+        if _is_silent:
             return False
         coroutine = self._do_cron_deliver(
             chat_id, content, task_name=task_name, run_time=run_time
