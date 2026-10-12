@@ -108,7 +108,18 @@ class StreamingController:
             await self._ensure_init()
             assert self._client is not None
 
-            reply_to_message_id = session.anchor_id or session.message_id
+            # SAKUYA_P9_V2 (P9, 2026-10-12 重打): fake id 不喂飞书.
+            # anchor/message_id 是 fb- / _sakuya_synth: 合成值时 Feishu 必拒 (99992354),
+            # 提前 yield to gateway → 干净 text fallback, 不留空卡壳.
+            _sakuya_rid = session.anchor_id or session.message_id
+            if _sakuya_rid and str(_sakuya_rid).startswith(("fb-", "_sakuya_synth:")):
+                _logger.warning(
+                    "_do_create_card: anchor/message id is synthetic (%s), yielding to gateway",
+                    str(_sakuya_rid)[:24],
+                )
+                session.state = SessionState.FAILED
+                return
+            reply_to_message_id = _sakuya_rid
             card = build_streaming_card_v2(
                 header_enabled=self._cfg.header_enabled,
                 width_mode=self._cfg.width_mode,
@@ -555,8 +566,16 @@ class StreamingController:
                 width_mode=self._cfg.width_mode,
             )
             new_card_id = await self._client.cardkit_create(card)
+            # SAKUYA_P9_V2: rebuild 路径同款 fake-id 拦截 (fb- / _sakuya_synth: 前缀不喂飞书)
+            _sakuya_rebuild_rid = session.anchor_id or session.message_id
+            if _sakuya_rebuild_rid and str(_sakuya_rebuild_rid).startswith(("fb-", "_sakuya_synth:")):
+                _logger.warning(
+                    "rebuild: anchor/message id is synthetic (%s), yielding to gateway",
+                    str(_sakuya_rebuild_rid)[:24],
+                )
+                raise FeishuAPIError(message="synthetic id rejected by SAKUYA_P9_V2", code=99992354)
             new_msg_id = await self._client.reply_card_by_id(
-                session.anchor_id or session.message_id, new_card_id,
+                _sakuya_rebuild_rid, new_card_id,
             )
         except Exception:
             _logger.warning(
