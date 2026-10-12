@@ -515,7 +515,23 @@ def _format_run_time(run_time: str) -> str:
 def build_cron_card(
     content: str, *, task_name: str = "", run_time: str = ""
 ) -> dict[str, Any]:
-    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容."""
+    """Cron 推送用的极简静态卡片 — schema 2.0，可选 header + markdown 内容.
+
+    SILENT_SKIP_PATCH: 2026-07-31 主人选 P1 (Layer B defense-in-depth, v2 regex 版)
+    """
+    # SILENT_SKIP_PATCH: empty / SILENT content → return {} so caller skips push
+    # 2026-08-01 教训: [SILENT 可能粘在散文里, 用 word-boundary 正则兜底
+    import re as _re
+    _stripped = (content or "").strip()
+    _is_silent = False
+    if not _stripped:
+        _is_silent = True
+    elif _stripped.upper() in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]"):
+        _is_silent = True
+    elif _re.search(r"\bSILENT\b", _stripped.upper()):
+        _is_silent = True
+    if _is_silent:
+        return {}
     card: dict[str, Any] = {
         "schema": "2.0",
         "config": {"wide_screen_mode": True, "locales": _LOCALES},

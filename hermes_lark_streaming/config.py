@@ -6,7 +6,13 @@ import os
 from pathlib import Path
 from typing import Any
 
-import yaml
+# SAKUYA_YAML_COMPAT_V1 (2026-10-07): PM 3.14 runtime 没有 PyYAML，插件曾在此
+# ModuleNotFoundError. 优先用 PyYAML；缺失时回落到 Hermes 核心的 hermes_yaml
+# (ruamel 封装, safe_load/YAMLError API 兼容), 已实测 parse 行为一致.
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - environment dependent
+    import hermes_yaml as yaml
 
 DEFAULT_DOMAIN = "https://open.feishu.cn"  # SDK 根域名，Larksuite 用 https://open.larksuite.com
 LARK_DOMAIN = "https://open.larksuite.com"

@@ -482,8 +482,30 @@ class StreamCardController(StreamingController):
         task_name: str = "",
         run_time: str = "",
     ) -> bool:
-        """Return True when card delivery owns the text, including an uncertain timeout."""
-        if not self.enabled or not content or not chat_id:
+        """Return True when card delivery owns the text, including an uncertain timeout.
+
+        SILENT_SKIP_PATCH: 2026-07-31 主人选 P1, plugin 不再推 SILENT cron
+        (v2: regex word-boundary SILENT — see hermes/cron-silent-push-fix SKILL.md)
+        """
+        if not self.enabled or not chat_id:
+            return False
+        # SILENT_SKIP_PATCH: 2026-07-31 主人选 P1 (Layer A, v1+v2 完整版, 2026-10-12 重打)
+        # v2 正则: 2026-08-01 教训 — [SILENT 可能粘在散文里, 精确 == 抓不到
+        import re as _re
+        _stripped = (content or "").strip()
+        _is_silent = False
+        if not _stripped:
+            _is_silent = True
+        elif _stripped.upper() in ("SILENT", "NO_REPLY", "NO REPLY", "[SILENT]"):
+            _is_silent = True
+        elif _re.search(r"\bSILENT\b", _stripped.upper()):
+            _is_silent = True
+        if _is_silent:
+            _logger.info(
+                "cron card skipped (silent): task=%s chat=%s len=%d preview=%r",
+                task_name or "<none>", chat_id[:12], len(content or ""),
+                _stripped[:80],
+            )
             return False
         coroutine = self._do_cron_deliver(
             chat_id, content, task_name=task_name, run_time=run_time

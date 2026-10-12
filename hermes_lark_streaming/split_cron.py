@@ -33,6 +33,9 @@ def _try_cron_card(t: Any, text: str, *, route_thread_id: Any = None,
             or route_metadata.get("notify", True) is not True
         ):
             return False
+        # SAKUYA_SILENT_SKIP_PATCH: suppress [SILENT] / whitespace-only cron cards (Layer B, pre-card)
+        if text.strip() == "[SILENT]":
+            return False
         from hermes_lark_streaming.patch import on_cron_deliver
 
         if getattr(t, "_hermes_lark_card_attempted", False):
