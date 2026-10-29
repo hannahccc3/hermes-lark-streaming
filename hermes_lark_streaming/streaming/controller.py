@@ -757,6 +757,12 @@ class StreamingController:
         )
 
         streaming_closed = False
+        # SAKUYA_PATCH_COMPLETE_FALLBACK (2026-10-29):
+        #   ① 封卡最终失败 → 显式标记 text_fallback, 让核心不再重发一条重复纯文本
+        #      (症状: 一次回复 = 一张真卡片 + 一条灰底 text 气泡, 并存)
+        #   ③ 封卡遇到 300313 (not find elementID) 等元素失效 → 关流式 + 重建整卡重试
+        #   + 成功/失败补日志 (原来 cardkit_update / cardkit_close_streaming 完全静默, 无法排障)
+        _STALE_ELEMENT_CODES = {300313}
         for attempt in range(3):
             try:
                 assert self._client is not None
@@ -775,6 +781,12 @@ class StreamingController:
                         sequence=session.sequence,
                     )
                 session.state = SessionState.COMPLETED
+                _logger.info(
+                    "CardKit complete OK: card_id=%s seq=%d elements=%d",
+                    session.card_id,
+                    session.sequence,
+                    len(card.get("body", {}).get("elements", []) or []),
+                )
                 return True
             except FeishuAPIError as e:
                 _logger.warning(
@@ -787,7 +799,40 @@ class StreamingController:
                     exc_info=True,
                 )
                 if session.guard.terminate("_do_complete_card", e):
+                    _mark_fb = getattr(self, "_mark_text_fallback_needed", None)
+                    if _mark_fb is not None:
+                        _mark_fb(session)
                     return False
+                # ③ 元素失效类错误 → 整卡重建重试 (关流式后用同一 card_id 覆写整张卡)
+                if getattr(e, "code", None) in _STALE_ELEMENT_CODES and session.card_id:
+                    try:
+                        session.sequence += 1
+                        await self._client.cardkit_close_streaming(
+                            session.card_id,
+                            sequence=session.sequence,
+                        )
+                        streaming_closed = True
+                        session.sequence += 1
+                        await self._client.cardkit_update(
+                            session.card_id,
+                            card,
+                            sequence=session.sequence,
+                        )
+                        session.state = SessionState.COMPLETED
+                        _logger.info(
+                            "CardKit complete OK after stale-element rebuild: card_id=%s seq=%d",
+                            session.card_id,
+                            session.sequence,
+                        )
+                        return True
+                    except Exception as rebuild_err:
+                        _logger.warning(
+                            "CardKit stale-element rebuild failed: card_id=%s seq=%d err=%s",
+                            session.card_id,
+                            session.sequence,
+                            rebuild_err,
+                            exc_info=True,
+                        )
                 if attempt < 2:
                     await asyncio.sleep(2**attempt)
                 continue
@@ -811,6 +856,17 @@ class StreamingController:
             session.sequence,
         )
         session.mark_failed()
+        # ① 封卡彻底失败 → 显式标记 text_fallback。
+        #    否则 consume_text_fallback() 返回 False → 分支不命中 → 核心会再发一条重复纯文本,
+        #    造成「一张真卡片 + 一条灰底 text 气泡」并存。
+        _mark_fb = getattr(self, "_mark_text_fallback_needed", None)
+        if _mark_fb is not None:
+            _mark_fb(session)
+        _logger.error(
+            "CardKit complete failed → text fallback armed: card_id=%s msg=%s",
+            session.card_id,
+            session.message_id[:12],
+        )
         return False
 
     async def _do_cron_deliver(
