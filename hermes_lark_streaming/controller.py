@@ -36,6 +36,8 @@ class StreamCardController(StreamingController):
         self._sessions: dict[str, CardSession] = {}
         self._session_keys: dict[str, CardSession] = {}
         self._interrupt_map: dict[str, str] = {}
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 最近一次内部注入消息 (msg=None) 的活跃 session
+        self._internal_active: CardSession | None = None
         self._initialized = False
         self._init_lock = threading.Lock()
         self._session_ttl = self._cfg.card_duration_sec
@@ -154,8 +156,22 @@ class StreamCardController(StreamingController):
         if not self.enabled:
             return
         if not message_id:
-            _logger.warning("on_message_started: missing message_id, chat=%s", chat_id[:12])
-            return
+            # SAKUYA_PATCH_INTERNAL_MSG_CARD (2026-10-29): 内部注入消息 (如后台进程
+            # 完成通知 [IMPORTANT: Background process ...]) 不经过飞书 webhook,
+            # 天然没有 message_id。之前直接 return 不建 session → 该轮回复走核心
+            # post 富文本投递 → 飞书里是一大块灰色容器 (主人观感: "不是卡片")。
+            # 现在合成内部 key 照常建卡; 建卡路径见 _do_create_card 的
+            # _sakuya_internal: 分支 (send_card_to_chat, 不走 reply_card_by_id —
+            # P9: 合成 id 喂 reply 必被飞书 99992354 拒)。
+            if not chat_id:
+                _logger.warning("on_message_started: missing message_id and chat_id, skipping")
+                return
+            message_id = f"_sakuya_internal:{int(time.time() * 1000)}"
+            _logger.info(
+                "on_message_started: internal msg (no message_id), synthetic key=%s chat=%s",
+                message_id[:32],
+                chat_id[:12],
+            )
         if message_id in self._sessions:
             return
 
@@ -175,18 +191,29 @@ class StreamCardController(StreamingController):
             self._sessions[anchor_id] = session
         _logger.info("session created: msg=%s chat=%s anchor=%s", message_id[:12], chat_id[:12], (anchor_id or "")[:12])
 
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 登记内部 session, 供完成钩子 (msg=None) 回查
+        if message_id.startswith("_sakuya_internal:"):
+            self._internal_active = session
+
         session.create_task = self._fire_and_forget(self._do_create_card(session), loop)
 
     def _mark_text_fallback_needed(self, session: CardSession) -> None:
         keys = {session.message_id}
         if session.anchor_id:
             keys.add(session.anchor_id)
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部轮次完成钩子拿到的 message_id 是 None,
+        # fallback 标记要覆盖哨兵键 (consume_text_fallback 入口把 None 映射过来)
+        if str(session.message_id).startswith("_sakuya_internal:"):
+            keys.add("_sakuya_internal:none")
         self._text_fallback_needed.update(keys)
         for key in keys:
             self._text_fallback_aliases[key] = set(keys)
 
     def consume_text_fallback(self, message_id: str) -> bool:
         """Return whether gateway should undo already_sent and deliver plain text."""
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部轮次完成钩子传 None → 映射到哨兵键
+        if message_id is None:
+            message_id = "_sakuya_internal:none"
         if message_id not in self._text_fallback_needed:
             return False
         keys = self._text_fallback_aliases.pop(message_id, {message_id})
@@ -609,6 +636,9 @@ class StreamCardController(StreamingController):
         session_key = session.session_key
         if session_key and self._session_keys.get(session_key) is session:
             del self._session_keys[session_key]
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部 session 收尾时摘除活跃登记
+        if getattr(self, "_internal_active", None) is session:
+            self._internal_active = None
         stale_keys = [key for key, value in self._interrupt_map.items() if value == session.message_id]
         for key in stale_keys:
             del self._interrupt_map[key]
@@ -617,6 +647,14 @@ class StreamCardController(StreamingController):
             session.image_resolver.cancel_pending()
 
     def _completion_session(self, message_id: str) -> CardSession | None:
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部注入轮次的完成钩子拿到的 message_id
+        # 也是 None (事件本身没有 om_id) → 用最近活跃的内部 session 兜底
+        # (单主人单 DM 场景, 同一 chat 的轮次串行, 无竞态窗口)。
+        if not message_id:
+            internal = getattr(self, "_internal_active", None)
+            if internal is not None and not internal.state.is_terminal:
+                return internal
+            return None
         session = self._sessions.get(message_id)
         if session is not None and (not session.state.is_terminal or session.state == SessionState.FAILED):
             return session

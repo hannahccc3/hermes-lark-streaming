@@ -125,25 +125,38 @@ class StreamingController:
                 width_mode=self._cfg.width_mode,
             )
             card_id = await self._client.cardkit_create(card)
-            try:
-                card_msg_id = await self._client.reply_card_by_id(
-                    reply_to_message_id,
-                    card_id,
+            # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部注入消息 (msg=None, 合成 key) 没有
+            # 可 reply 的真实 om_id — P9 明确禁止合成 id 喂 reply_card_by_id (99992354),
+            # 改走 send_card_to_chat 按 chat 直发。
+            if str(session.message_id).startswith("_sakuya_internal:"):
+                card_msg_id = await self._client.send_card_to_chat(
+                    chat_id=session.chat_id,
+                    card={"type": "card", "data": {"card_id": card_id}},
                 )
-            except FeishuAPIError as error:
-                if error.code != CARDKIT_CONTENT_FAILED:
-                    raise
-                card_id = await self._client.cardkit_create(card)
+                _logger.info(
+                    "CardKit card created via send_card_to_chat (internal msg): card_id=%s",
+                    (card_id or "")[:12],
+                )
+            else:
                 try:
                     card_msg_id = await self._client.reply_card_by_id(
                         reply_to_message_id,
                         card_id,
                     )
-                except FeishuAPIError:
-                    card_msg_id = await self._client.send_card_to_chat(
-                        chat_id=session.chat_id,
-                        card={"type": "card", "data": {"card_id": card_id}},
-                    )
+                except FeishuAPIError as error:
+                    if error.code != CARDKIT_CONTENT_FAILED:
+                        raise
+                    card_id = await self._client.cardkit_create(card)
+                    try:
+                        card_msg_id = await self._client.reply_card_by_id(
+                            reply_to_message_id,
+                            card_id,
+                        )
+                    except FeishuAPIError:
+                        card_msg_id = await self._client.send_card_to_chat(
+                            chat_id=session.chat_id,
+                            card={"type": "card", "data": {"card_id": card_id}},
+                        )
             session.set_card(card_id=card_id, card_msg_id=card_msg_id)
             session.element_count = 1  # loading element
             session.flush.set_throttle(CARDKIT_MS)
