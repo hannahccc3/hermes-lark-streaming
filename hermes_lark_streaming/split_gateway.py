@@ -141,7 +141,8 @@ def inject_gateway(filename: str, content: str) -> str:
                 # Reserve one text transport until the outer completion hook decides delivery.
                 # Include failed creation sessions: native finish() must not send ahead of the
                 # completion hook clearing already_sent and delivering the full fallback text.
-                if _lark_ctrl.enabled and {identity} in _lark_ctrl._sessions:
+                if _lark_ctrl.enabled and ({identity} in _lark_ctrl._sessions
+                                           or _lark_ctrl.has_internal_session()):  # SAKUYA_PATCH_INTERNAL_MSG_CARD: msg=None 内部轮放行
                     def _lark_stream_delta(text):
                         if not ctx._run_still_current():
                             return

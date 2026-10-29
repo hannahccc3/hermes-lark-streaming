@@ -121,10 +121,27 @@ class StreamCardController(StreamingController):
 
     def _get_active_session(self, message_id: str) -> CardSession | None:
         """获取非终态的活跃 session，不存在或已终态返回 None."""
+        # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部注入轮次的所有输出/完成钩子拿到的
+        # message_id 都是 None (事件本身没有 om_id) → 回查最近活跃的内部 session
+        # (单主人单 DM 场景, 同一 chat 轮次串行, 无竞态窗口)。
+        if not message_id:
+            internal = getattr(self, "_internal_active", None)
+            if internal is not None and not internal.state.is_terminal:
+                return internal
+            return None
         session = self._sessions.get(message_id)
         if session is None or session.state.is_terminal:
             return None
         return session
+
+    def has_internal_session(self) -> bool:
+        """SAKUYA_PATCH_INTERNAL_MSG_CARD: 是否有活跃的内部注入 session (msg=None 轮).
+
+        split_gateway.py 的流式回调注册守卫用: 正常轮按 message_id 判 membership,
+        内部轮 message_id 是 None, 必须用本方法放行, 否则回复走 post 富文本。
+        """
+        internal = getattr(self, "_internal_active", None)
+        return internal is not None and not internal.state.is_terminal
 
     def _fire_and_forget(
         self,
