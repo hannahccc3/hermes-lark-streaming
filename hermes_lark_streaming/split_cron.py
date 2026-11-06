@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from typing import Any
+
+
+def _cron_now_iso() -> str:
+    """Actual dispatch time for the cron card header (SAKUYA_CRON_RUNTIME_V2)."""
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="minutes")
 
 
 def _try_cron_card(t: Any, text: str, *, route_thread_id: Any = None,
@@ -45,7 +51,13 @@ def _try_cron_card(t: Any, text: str, *, route_thread_id: Any = None,
         t._hermes_lark_card_attempted = True
         return bool(on_cron_deliver(
             chat_id=t.chat_id, content=text.strip(), loop=t.loop,
-            task_name=t.job.get("name", ""), run_time=t.job.get("next_run_at", ""),
+            task_name=t.job.get("name", ""),
+            # SAKUYA_CRON_RUNTIME_V2 (2026-11-06): header time must be the ACTUAL
+            # dispatch time, not next_run_at (a timestamp hours in the future).
+            # Same rationale as the 2026-08-30 P24 fix — that patch lived in the
+            # old monolithic scheduler template and was lost when v0.13.0 moved
+            # cron card assembly into split_cron.py.
+            run_time=_cron_now_iso(),
         ))
     except Exception:
         # Missing fields, import failure, or a disabled/broken plugin all yield
