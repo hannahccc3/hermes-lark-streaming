@@ -12,13 +12,14 @@ import urllib.request
 from functools import cache
 from pathlib import Path
 
-from hermes_lark_streaming.split_gateway import GATEWAY_FILES, inject_gateway
+from hermes_lark_streaming.split_gateway import AGENT_FILES, GATEWAY_FILES, inject_gateway
 
 SAMPLES_DIR = Path(__file__).parent / "samples"
 MANIFEST_PATH = Path(__file__).with_suffix(".json")
 TREE_FILES = (
     "gateway/run.py",
     *(f"gateway/{name}" for name in GATEWAY_FILES),
+    *(f"agent/{name}" for name in AGENT_FILES),  # SAKUYA_PATCH_FALLBACK_CARD_RESET
     "cron/scheduler.py",
     "cron/scheduler_delivery.py",
 )

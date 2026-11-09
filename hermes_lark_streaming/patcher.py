@@ -37,6 +37,8 @@ _HOOK_NAMES = [
     "INTERRUPT",
     "BG_DELIVER",
     "CLARIFY",
+    "MSG_STAMP",
+    "FALLBACK_RESET",
 ]
 MARKERS: list[tuple[str, str]] = [(f"# {PREFIX}_{n}_BEGIN", f"# {PREFIX}_{n}_END") for n in _HOOK_NAMES]
 
@@ -48,6 +50,8 @@ MK_ABORT, MK_ABORT_END = MARKERS[10]
 MK_STOP, MK_STOP_END = MARKERS[11]
 MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[13]
 MK_CLARIFY, MK_CLARIFY_END = MARKERS[14]
+MK_MSG_STAMP, MK_MSG_STAMP_END = MARKERS[15]
+MK_FALLBACK_RESET, MK_FALLBACK_RESET_END = MARKERS[16]
 
 _BACKUP_SUFFIX = ".hermes_lark.bak"
 
@@ -410,6 +414,55 @@ def _clarify_hook(indent: str) -> str:
     )
 
 
+def _msg_stamp_hook(indent: str) -> str:
+    """SAKUYA_PATCH_FALLBACK_CARD_RESET: 把 feishu message_id 戳到 agent 上。
+
+    注入点：gateway/run_turn_runner.py ``_wire_turn_agent_callbacks``（agent/ctx 均在作用域）。
+    try_activate_fallback 的清卡钩子靠这个戳定位要清卡的 session；非 feishu 平台不盖戳，
+    清卡钩子自然 no-op。ctx_hook 会把 ctx.event_message_id 重写为 inbound/event 身份表达式。
+    """
+    return _make_hook(
+        indent,
+        MK_MSG_STAMP,
+        MK_MSG_STAMP_END,
+        [
+            "try:",
+            "    if ctx.source.platform.value.lower() in ('feishu', 'lark'):",
+            "        agent._lark_stream_message_id = ctx.event_message_id",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
+def _fallback_reset_hook(indent: str) -> str:
+    """SAKUYA_PATCH_FALLBACK_CARD_RESET: 流式中途 fallback 激活 → 清卡重流。
+
+    注入点：agent/chat_completion_helpers.py ``try_activate_fallback`` 成功路径
+    （``agent._provider_fallback_active = True`` 之后，此刻 fb_model/fb_provider 已定）。
+    core 的保留契约不清流面——已流出的半截 answer 会和备用模型的完整重答叠在同一张卡上
+    （2026-10-30 12:23 MiniMax 429 事故的根因链）。此钩子在激活瞬间通知插件回收半截文本。
+    """
+    return _make_hook(
+        indent,
+        MK_FALLBACK_RESET,
+        MK_FALLBACK_RESET_END,
+        [
+            "try:",
+            "    _lark_mid = getattr(agent, '_lark_stream_message_id', None)",
+            "    if _lark_mid:",
+            "        from hermes_lark_streaming.patch import on_fallback_activated",
+            "        on_fallback_activated(",
+            "            message_id=_lark_mid,",
+            "            fallback_model=str(fb_model),",
+            "            fallback_provider=str(fb_provider),",
+            "        )",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
 def _remove_block(content: str, begin: str, end: str) -> str:
     lines = content.splitlines(keepends=True)
     result: list[str] = []
@@ -569,9 +622,14 @@ class Patcher:
 
     @property
     def target_paths(self) -> list[Path]:
-        from .split_gateway import GATEWAY_FILES
+        from .split_gateway import AGENT_FILES, GATEWAY_FILES
 
-        return [self.run_path, *(self.run_path.parent / name for name in GATEWAY_FILES)]
+        agent_dir = self.run_path.parent.parent / "agent"
+        return [
+            self.run_path,
+            *(self.run_path.parent / name for name in GATEWAY_FILES),
+            *(agent_dir / name for name in AGENT_FILES),  # SAKUYA_PATCH_FALLBACK_CARD_RESET
+        ]
 
     def is_patched(self) -> bool:
         return any(

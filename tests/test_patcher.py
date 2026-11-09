@@ -220,8 +220,17 @@ class TestApplyRemove:
         assert "session_key=locals().get('session_key') or locals().get('_quick_key')" in turn
 
         # Interrupt redirects the card to the pending follow-up identity.
+        # SAKUYA_PATCH_V2_SPLIT (P10.5): NO or-fallback to the reply anchor — a pending_event
+        # without message_id must NOT inherit next_message_id (it would be fed to Feishu as an
+        # open_message_id). SAKUYA_PATCH_FOLLOWUP_INTERNAL_CARD: the None-id follow-up still
+        # calls on_message_started (else-branch) so internal cards get synthesized keys.
         assert "# HERMES_LARK_INTERRUPT_BEGIN" in turn
-        assert "_lark_next_id = getattr(pending_event, 'message_id', None) or next_message_id" in turn
+        assert "SAKUYA_PATCH_V2_SPLIT" in turn
+        assert (
+            "_lark_next_id = getattr(pending_event, 'message_id', None) or next_message_id"
+            not in turn
+        )
+        assert "SAKUYA_PATCH_FOLLOWUP_INTERNAL_CARD" in turn
         assert "new_message_id=_lark_next_id" in turn
         assert "anchor_id=next_message_id" in turn
         assert "session_key=next_session_key" in turn

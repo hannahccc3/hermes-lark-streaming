@@ -343,6 +343,53 @@ class StreamCardController(StreamingController):
         self._schedule_flush(session)
         return True
 
+    def on_fallback_activated(
+        self, *, message_id: str, fallback_model: str, fallback_provider: str
+    ) -> bool:
+        """流式中途 fallback 激活 → 清掉已流出的半截 answer 文本（SAKUYA_PATCH_FALLBACK_CARD_RESET）。
+
+        core 的保留契约（turn_recovery.settle_delivered_partial / _with_delivered_partial）
+        不会回收已推到卡面上的半截文本，fallback 重答会与其叠加成"两段重复"。此方法在
+        try_activate_fallback 成功瞬间被注入钩子调用：
+          - 把所有已创建的 answer 段文本清空（卡面经 cardkit_stream_element 整段替换）；
+          - 最后一个 answer 段替换为提示行，备用模型的增量从干净卡面继续追加；
+          - reasoning/tool 段不动（思考面板保留原样，不在重复症状范围内）。
+        返回 True 表示确实执行了清卡；session 不存在 / 已终态 / 还没有可见 answer 文本
+        （pre-stream fallback）时返回 False，不做任何事。
+        """
+        if not self.enabled:
+            return False
+        session = self._get_active_session(message_id)
+        if session is None or session.state.is_terminal:
+            return False
+        answer_segs = [
+            seg
+            for seg in session.segment_state.segments
+            if seg.type == SegmentType.ANSWER and seg.created
+        ]
+        if not any(seg.text.strip() for seg in answer_segs):
+            return False  # pre-stream fallback：尚无可见文本，无需清卡
+        notice = (
+            f"⚠️ 主模型限流中断，已切换备用模型"
+            f"（{fallback_provider}/{fallback_model}）重新作答：\n\n"
+        )
+        for seg in answer_segs[:-1]:
+            seg.text = ""
+            seg.dirty = True
+        tail = answer_segs[-1]
+        tail.text = notice
+        tail.dirty = True
+        _logger.info(
+            "SAKUYA_PATCH_FALLBACK_CARD_RESET: msg=%s cleared %d answer seg(s), "
+            "fallback=%s/%s",
+            message_id[:12],
+            len(answer_segs),
+            fallback_provider,
+            fallback_model,
+        )
+        self._schedule_flush(session)
+        return True
+
     def on_aborted(self, *, message_id: str) -> None:
         """用户 /stop 导致消息被中断."""
         if not self.enabled:

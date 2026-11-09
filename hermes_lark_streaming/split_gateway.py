@@ -11,6 +11,7 @@ import textwrap
 from collections.abc import Callable, Iterator
 
 GATEWAY_FILES = ("run_inbound.py", "run_turn.py", "run_turn_runner.py", "run_busy.py")
+AGENT_FILES = ("chat_completion_helpers.py",)  # SAKUYA_PATCH_FALLBACK_CARD_RESET: agent 层清卡钩子
 
 
 def _scoped_nodes(node: ast.AST) -> Iterator[ast.AST]:
@@ -30,7 +31,7 @@ def inject_gateway(filename: str, content: str) -> str:
     # Local import: patcher can delegate here without an import cycle.
     from . import patcher as p
 
-    if filename not in GATEWAY_FILES:
+    if filename not in GATEWAY_FILES and filename not in AGENT_FILES:
         raise p.PatcherError(f"Unsupported split gateway file: {filename}")
     try:
         tree = ast.parse(content, filename=filename)
@@ -181,6 +182,22 @@ def inject_gateway(filename: str, content: str) -> str:
         insert(node, ctx_hook(p._background_review_hook), after=True)
         node = statement(wire, "agent.clarify_callback = self._clarify_callback_sync")[0]
         insert(node, ctx_hook(p._clarify_hook), after=True)
+        # SAKUYA_PATCH_FALLBACK_CARD_RESET: 给 agent 盖 feishu message_id 戳，
+        # try_activate_fallback 激活时据此定位要清卡的 session（core 侧无此信息）。
+        node = statement(wire, "agent.clarify_callback = self._clarify_callback_sync")[0]
+        insert(node, ctx_hook(p._msg_stamp_hook), after=True)
+
+    elif filename == "chat_completion_helpers.py":
+        # SAKUYA_PATCH_FALLBACK_CARD_RESET: 流式中途 fallback 激活即清卡重流。
+        # 锚点 agent._provider_fallback_active = True 是激活成功路径的唯一赋值，
+        # 此刻已流出的半截 answer 文本还在卡面上（core 保留契约不清流面），
+        # 由插件回收：卡面替换为提示行，备用模型从干净卡面重新作答。
+        node = select(
+            "try_activate_fallback",
+            lambda n: isinstance(n, ast.Assign)
+            and ast.unparse(n) == "agent._provider_fallback_active = True",
+        )[0]
+        insert(node, p._fallback_reset_hook, after=True)
 
     else:
         handler = "_handle_message_with_agent"
@@ -276,7 +293,9 @@ def inject_gateway(filename: str, content: str) -> str:
         insert(node, guarded("INTERRUPT", f"""
             if source.platform.value.lower() in ('feishu', 'lark'):
                 from hermes_lark_streaming.patch import on_message_interrupted, on_message_started, on_message_aborted
-                _lark_next_id = getattr(pending_event, 'message_id', None) or next_message_id
+                # SAKUYA_PATCH_V2_SPLIT (P10.5): pending_event.message_id 不得 or-fallback
+                # 到 next_message_id（reply anchor）——否则 anchor 被当 open_message_id 喂飞书。
+                _lark_next_id = getattr(pending_event, 'message_id', None)
                 turn_ctx._hermes_lark_followup_id = _lark_next_id
                 if result.get('interrupted') and _lark_next_id:
                     on_message_interrupted(message_id={turn_identity}, new_message_id=_lark_next_id,
@@ -284,7 +303,11 @@ def inject_gateway(filename: str, content: str) -> str:
                                            session_key=next_session_key)
                 elif result.get('interrupted'):
                     on_message_aborted(message_id={turn_identity})
-                elif _lark_next_id:
+                else:
+                    # SAKUYA_PATCH_FOLLOWUP_INTERNAL_CARD (2026-10-29): msg=None 的
+                    # follow-up (如 ASYNC DELEGATION COMPLETE 通知) 也必须调
+                    # on_message_started —— INTERNAL_MSG_CARD patch 会合成 key 建卡;
+                    # 旧条件 `elif _lark_next_id:` 把 None 轮挡在钩子外 → post 灰容器
                     on_message_started(message_id=_lark_next_id, chat_id=next_source.chat_id,
                                        anchor_id=next_message_id, session_key=next_session_key)
         """))
@@ -319,7 +342,8 @@ def inject_gateway(filename: str, content: str) -> str:
                 raise p.PatcherError(f"{filename}:{follow}: unexpected inbound identity resolution")
         insert(node, guarded("FOLLOWUP_RESULT", """
             from hermes_lark_streaming.patch import on_queued_followup_result
-            _lark_next_id = getattr(pending_event, 'message_id', None) or next_message_id
+            # SAKUYA_PATCH_V2_SPLIT (P10.5): 同 INTERRUPT 处，禁止 or-fallback 到 anchor。
+            _lark_next_id = getattr(pending_event, 'message_id', None)
             if _lark_next_id:
                 on_queued_followup_result(message_id=_lark_next_id, followup_result=followup_result)
         """), after=True)

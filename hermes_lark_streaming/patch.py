@@ -230,6 +230,24 @@ def on_answer_delta(*, ctrl: Any, message_id: str, text: str) -> bool:
 
 
 @_safe_hook(default_return=False, log_level="debug")
+def on_fallback_activated(
+    *, ctrl: Any, message_id: str, fallback_model: str, fallback_provider: str
+) -> bool:
+    """[注入点 17] try_activate_fallback 成功路径 — SAKUYA_PATCH_FALLBACK_CARD_RESET.
+
+    流式中途 fallback 激活时回收已流出的半截 answer 文本，卡面替换为提示行，
+    备用模型从干净卡面重新作答（修复 2026-10-30 两段文本叠加事故的根因链）。
+    """
+    return bool(
+        ctrl.on_fallback_activated(
+            message_id=message_id,
+            fallback_model=fallback_model,
+            fallback_provider=fallback_provider,
+        )
+    )
+
+
+@_safe_hook(default_return=False, log_level="debug")
 def on_thinking_delta(*, ctrl: Any, message_id: str, text: str) -> bool:
     """[注入点 5] _interim_assistant_cb — thinking.delta."""
     return bool(ctrl.on_thinking(message_id=message_id, text=text))
