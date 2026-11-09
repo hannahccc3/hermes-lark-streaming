@@ -347,6 +347,36 @@ def inject_gateway(filename: str, content: str) -> str:
             if _lark_next_id:
                 on_queued_followup_result(message_id=_lark_next_id, followup_result=followup_result)
         """), after=True)
+        # SAKUYA_PATCH_INTERNAL_SEAL (2026-11-09): 封住内部注入轮 (msg=None) 的卡.
+        # 事故: 内部轮建了卡 (_sakuya_internal:*) 却没人封 → 卡停在 streaming →
+        # core 判定"没送达" → 同一内容补发一份原生灰底文本 → 一模两条。
+        # 封卡钩子 FOLLOWUP_COMPLETE 属于主轮, 封不到内部轮建的卡, 必须在这里补。
+        insert(node, guarded("FOLLOWUP_SEAL", """
+            if not getattr(pending_event, 'message_id', None):
+                # 仅内部轮 (msg=None) 需要: 它建的是 _sakuya_internal:* 合成卡。
+                try:
+                    from hermes_lark_streaming.patch import on_internal_followup_seal
+                    _lark_internal_answer = ''
+                    if isinstance(followup_result, dict):
+                        _lark_internal_answer = followup_result.get('final_response') or ''
+                    _lark_internal_sealed = await on_internal_followup_seal(
+                        message_id=None,
+                        answer=_lark_internal_answer,
+                        is_error=bool(followup_result.get('failed')) if isinstance(followup_result, dict) else False,
+                        model=(followup_result.get('model') or '') if isinstance(followup_result, dict) else '',
+                        tokens={'input_tokens': followup_result.get('input_tokens', 0),
+                                'output_tokens': followup_result.get('output_tokens', 0)} if isinstance(followup_result, dict) else None,
+                        context={'used_tokens': followup_result.get('last_prompt_tokens', 0),
+                                 'max_tokens': followup_result.get('context_length', 0)} if isinstance(followup_result, dict) else None,
+                    )
+                    if _lark_internal_sealed and isinstance(followup_result, dict):
+                        # 卡片已封 → core 不应再补发原生文本。
+                        followup_result['already_sent'] = True
+                        followup_result['response_previewed'] = True
+                except Exception:
+                    import logging as _lark_logging
+                    _lark_logging.getLogger("hermes_lark_streaming").exception("injected hook failed: followup_seal")
+        """), after=True)
         node = assignment("_run_agent_cleanup_turn_tasks", "(stream_consumer_holder, session_key)")
         # The parent context owns the newly started follow-up until its recursive call
         # returns. This also catches failures before the child's own cleanup is armed.

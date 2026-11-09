@@ -38,6 +38,15 @@ class StreamCardController(StreamingController):
         self._interrupt_map: dict[str, str] = {}
         # SAKUYA_PATCH_INTERNAL_MSG_CARD: 最近一次内部注入消息 (msg=None) 的活跃 session
         self._internal_active: CardSession | None = None
+        # SAKUYA_PATCH_INTERNAL_SEAL (2026-11-09): 内部注入轮 (msg=None) 的 session 登记表.
+        # 事故: 内部轮 (watch-pattern / async-delegation 通知) 建了卡 _sakuya_internal:*,
+        # 但**没有任何钩子封它** —— 封卡钩子 FOLLOWUP_COMPLETE 属于主轮的
+        # _run_agent_deliver_first_response, 封的是主卡; 内部卡永远停在 state=streaming,
+        # core 以为"卡片没送达" → 同一内容再发一份飞书原生灰底文本 → 主人看到一模两条。
+        # 单槽位 _internal_active 也不够: 主卡 _cleanup_session 会把它置 None,
+        # 内部轮再查就找不到自己的卡 (22:53:42.372 主卡 cleanup 早于内部卡创建 5ms)。
+        # 这里改为登记所有活跃内部 session, 封卡时按 chat 反查最新且非终态的那个。
+        self._internal_sessions: dict[str, CardSession] = {}
         self._initialized = False
         self._init_lock = threading.Lock()
         self._session_ttl = self._cfg.card_duration_sec
@@ -119,12 +128,33 @@ class StreamCardController(StreamingController):
             return self._loop
         return None
 
+    def _internal_session_for(self, chat_id: str | None = None) -> CardSession | None:
+        """SAKUYA_PATCH_INTERNAL_SEAL (2026-11-09): 找本 chat 最新且非终态的内部 session.
+
+        取代单槽位 ``_internal_active`` 作为唯一真相: 主卡的 ``_cleanup_session`` 会把
+        ``_internal_active`` 置 None, 而内部轮恰好在主卡收尾之后才建卡/封卡
+        (2026-11-09 22:53:42.372 vs .377), 单槽位必然查空 → 封卡静默失败 →
+        core 补发原生文本 → 一模两条。这里按登记顺序倒序找第一个非终态内部 session。
+        """
+        best: CardSession | None = None
+        for session in reversed(list(self._internal_sessions.values())):
+            if session.state.is_terminal:
+                continue
+            if chat_id and getattr(session, "chat_id", None) != chat_id:
+                continue
+            return session
+        return best
+
     def _get_active_session(self, message_id: str) -> CardSession | None:
         """获取非终态的活跃 session，不存在或已终态返回 None."""
         # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部注入轮次的所有输出/完成钩子拿到的
         # message_id 都是 None (事件本身没有 om_id) → 回查最近活跃的内部 session
         # (单主人单 DM 场景, 同一 chat 轮次串行, 无竞态窗口)。
         if not message_id:
+            # SAKUYA_PATCH_INTERNAL_SEAL: 登记表优先 (主卡 cleanup 不会清掉内部卡)。
+            internal = self._internal_session_for()
+            if internal is not None:
+                return internal
             internal = getattr(self, "_internal_active", None)
             if internal is not None and not internal.state.is_terminal:
                 return internal
@@ -141,7 +171,10 @@ class StreamCardController(StreamingController):
         内部轮 message_id 是 None, 必须用本方法放行, 否则回复走 post 富文本。
         """
         internal = getattr(self, "_internal_active", None)
-        return internal is not None and not internal.state.is_terminal
+        # SAKUYA_PATCH_INTERNAL_SEAL: 登记表也算 (主卡 cleanup 不清内部卡)。
+        if internal is not None and not internal.state.is_terminal:
+            return True
+        return self._internal_session_for() is not None
 
     def _fire_and_forget(
         self,
@@ -211,6 +244,8 @@ class StreamCardController(StreamingController):
         # SAKUYA_PATCH_INTERNAL_MSG_CARD: 登记内部 session, 供完成钩子 (msg=None) 回查
         if message_id.startswith("_sakuya_internal:"):
             self._internal_active = session
+            # SAKUYA_PATCH_INTERNAL_SEAL: 同时登记到多槽位表 (主卡 cleanup 只清单槽位)。
+            self._internal_sessions[message_id] = session
 
         session.create_task = self._fire_and_forget(self._do_create_card(session), loop)
 
@@ -703,6 +738,8 @@ class StreamCardController(StreamingController):
         # SAKUYA_PATCH_INTERNAL_MSG_CARD: 内部 session 收尾时摘除活跃登记
         if getattr(self, "_internal_active", None) is session:
             self._internal_active = None
+        # SAKUYA_PATCH_INTERNAL_SEAL: 同时摘除多槽位登记
+        self._internal_sessions.pop(session.message_id, None)
         stale_keys = [key for key, value in self._interrupt_map.items() if value == session.message_id]
         for key in stale_keys:
             del self._interrupt_map[key]
@@ -715,6 +752,11 @@ class StreamCardController(StreamingController):
         # 也是 None (事件本身没有 om_id) → 用最近活跃的内部 session 兜底
         # (单主人单 DM 场景, 同一 chat 的轮次串行, 无竞态窗口)。
         if not message_id:
+            # SAKUYA_PATCH_INTERNAL_SEAL (2026-11-09): 登记表优先 —— 主卡收尾会清单槽位
+            # _internal_active, 内部轮恰好在主卡收尾后才建卡, 查单槽位必然查空。
+            internal = self._internal_session_for()
+            if internal is not None:
+                return internal
             internal = getattr(self, "_internal_active", None)
             if internal is not None and not internal.state.is_terminal:
                 return internal

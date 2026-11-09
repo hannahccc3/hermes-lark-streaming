@@ -204,6 +204,46 @@ def on_queued_followup_result(*, ctrl: Any, message_id: str, followup_result: di
 
 
 @_safe_hook(default_return=False)
+async def on_internal_followup_seal(
+    *,
+    ctrl: Any,
+    message_id: str | None = None,
+    answer: str = "",
+    is_error: bool = False,
+    model: str = "",
+    tokens: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+) -> bool:
+    """SAKUYA_PATCH_INTERNAL_SEAL (2026-11-09): 封住内部注入轮 (msg=None) 的卡片.
+
+    事故 (2026-11-09 22:53): watch-pattern / async-delegation 通知走
+    ``_run_agent_queued_followup`` → INTERRUPT 钩子建卡 (``_sakuya_internal:*``),
+    但**没有任何钩子封它** —— 封卡钩子 FOLLOWUP_COMPLETE 属于主轮的
+    ``_run_agent_deliver_first_response``, 封的是主卡。内部卡永远停在
+    ``state=streaming`` → core 判定"卡片没送达" → 22:53:58 同一内容补发一份
+    飞书原生灰底文本 → 主人看到"一模两条 (白卡 + 灰底)"。
+
+    这里在 follow-up 轮返回时封掉本轮建的内部卡; 返回 True 表示卡片已封,
+    调用方应据此设 ``already_sent``, 让 core 不再补发原生文本。
+
+    ``message_id`` 恒为 None (内部轮没有 om_id) —— controller 按内部 session
+    登记表回查目标卡。
+    """
+    return bool(
+        await ctrl.on_completed_wait(
+            message_id=message_id,  # None → controller 走内部 session 登记表回查
+            answer=answer,
+            is_error=is_error,
+            reconcile_answer=is_error,
+            duration=0.0,
+            model=model,
+            tokens=tokens,
+            context=context,
+        )
+    )
+
+
+@_safe_hook(default_return=False)
 def on_tool_updated(
     *,
     ctrl: Any,
