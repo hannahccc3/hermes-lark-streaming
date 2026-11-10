@@ -587,9 +587,27 @@ class StreamingController:
                     str(_sakuya_rebuild_rid)[:24],
                 )
                 raise FeishuAPIError(message="synthetic id rejected by SAKUYA_P9_V2", code=99992354)
-            new_msg_id = await self._client.reply_card_by_id(
-                _sakuya_rebuild_rid, new_card_id,
-            )
+            # SAKUYA_PATCH_INTERNAL_SEAL (2026-11-10): 内部注入轮 (msg=None, 合成 key
+            # _sakuya_internal:*) 的切卡路径必须与首次建卡同款走 send_card_to_chat。
+            # 事故: 首次建卡 (_do_create_card) 有 _sakuya_internal: 分支走 send_card_to_chat,
+            # 但**切卡建新卡** (_create_streaming_card) 没有 → 它拿合成 id 喂
+            # reply_card_by_id → 飞书拒 (99992354) → _do_split_card 返回 None →
+            # session.split_disabled = True (降级: 继续写当前卡) → 切卡再也不会发生
+            # → 元素数一路涨到飞书硬上限 → code=300305 element exceeds the limit
+            # → 封卡 (cardkit_update 全量重建) 同样超限失败 → 卡片永远封不上。
+            if str(session.message_id).startswith("_sakuya_internal:"):
+                new_msg_id = await self._client.send_card_to_chat(
+                    chat_id=session.chat_id,
+                    card={"type": "card", "data": {"card_id": new_card_id}},
+                )
+                _logger.info(
+                    "CardKit split card created via send_card_to_chat (internal msg): card_id=%s",
+                    (new_card_id or "")[:12],
+                )
+            else:
+                new_msg_id = await self._client.reply_card_by_id(
+                    _sakuya_rebuild_rid, new_card_id,
+                )
         except Exception:
             _logger.warning(
                 "CardKit create streaming card failed for msg=%s",
