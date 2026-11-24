@@ -22,6 +22,18 @@ _logger = logging.getLogger(__name__)
 ACTIVE: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
+def _render_cron_card(content: str) -> dict[str, Any] | None:
+    # Imported lazily so a missing/broken SAKUYA module can never take down the
+    # ordinary static-card path (old `_try_cron_card` fail-open semantics).
+    try:
+        from .sakuya_cron import try_render_cron_card
+
+        return try_render_cron_card(content)
+    except Exception:
+        _logger.warning("%s: cron card render failed; using static card", "SAKUYA_CRON_CARD_NATIVE_V1", exc_info=True)
+        return None
+
+
 class FeishuStreamingAdapter(builtin.FeishuAdapter):
     SUPPORTS_NATIVE_STREAMING = True
     SUPPORTS_MESSAGE_EDITING = True
@@ -116,6 +128,20 @@ class FeishuStreamingAdapter(builtin.FeishuAdapter):
             return await super().send(chat_id, content, reply_to=reply_to, metadata=metadata)
         anchor = reply_to or md.get("reply_to_message_id") or md.get("thread_id")
         try:
+            # SAKUYA_CRON_CARD_NATIVE_V1: wrapped cron pushes render with the
+            # blue "⏰ task · dispatch time" header (old split_cron parity);
+            # `{}` means a SILENT-only body — skip the push, report success.
+            cron_card = _render_cron_card(content)
+            if cron_card is not None:
+                if not cron_card:
+                    return SendResult(success=True, message_id=None)
+                assert self.cards._client is not None
+                message_id = await self.cards._client.send_card_to_chat(
+                    chat_id,
+                    cron_card,
+                    reply_to_message_id=anchor,
+                )
+                return SendResult(success=True, message_id=message_id)
             card = build_static_card(content)
             assert self.cards._client is not None
             message_id = await self.cards._client.send_card_to_chat(
