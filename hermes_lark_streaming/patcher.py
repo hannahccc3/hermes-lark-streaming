@@ -248,6 +248,12 @@ def _start_hook(indent: str) -> str:
 
 
 def _complete_body(indent: str) -> str:
+    # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT_V2 (2026-11-24): Hermes v0.23.3 moved the
+    # completion hook into `_deliver_turn_response_then_limit_offer`, whose params
+    # are `footer_line` / `intentional_silence` (no underscore) and which has no
+    # `_turn_seconds` / `_lark_original_response` locals. The controller computes
+    # the card elapsed time itself (session.footer duration setdefault), so a
+    # literal 0.0 here is cosmetic-only.
     lines = [
         "try:",
         "    from hermes_lark_streaming.patch import on_message_completed_wait, on_message_needs_text_fallback",
@@ -257,8 +263,8 @@ def _complete_body(indent: str) -> str:
         "        answer=_lark_completion_answer,",
         "        is_error=bool(agent_result.get('failed')),",
         "        reconcile_answer=bool(agent_result.get('failed') or agent_result.get('response_transformed')",
-        "                             or _lark_completion_answer != _lark_original_response),",
-        "        duration=_turn_seconds,",
+        "                             or _lark_completion_answer != response),",
+        "        duration=0.0,",
         "        model=agent_result.get('model', ''),",
         "        tokens={",
         "            'input_tokens': agent_result.get('input_tokens', 0),",
@@ -271,7 +277,7 @@ def _complete_body(indent: str) -> str:
         "    )",
         "    if _lark_card_sent:",
         "        agent_result['already_sent'] = True",
-        "        _footer_line = ''",
+        "        footer_line = ''  # card already carries usage; kill the trailing footer send",
         "        if agent_result.get('failed'):",
         "            response = ''",
         "    elif on_message_needs_text_fallback(message_id=_lark_completion_id):",

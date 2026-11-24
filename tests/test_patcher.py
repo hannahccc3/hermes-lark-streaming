@@ -49,13 +49,17 @@ def _cron_patcher(path: Path) -> CronPatcher:
 
 
 def _build_complete_body_runner():
+    # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT_V2: v0.23.3's
+    # `_deliver_turn_response_then_limit_offer` params are `footer_line` /
+    # `intentional_silence` and it has no `_turn_seconds` / `_lark_original_response`
+    # locals — mirror that environment exactly (the old pre-defs would mask a
+    # regression like the UnboundLocalError from 2026-11-24 10:57-11:24).
     namespace: dict = {}
     source = (
-        "async def complete(agent_result, event, response, _response_time, _footer_line):\n"
-        "    _lark_completion_answer = _lark_original_response = response\n"
-        "    _turn_seconds = _response_time\n"
+        "async def complete(agent_result, event, response, _response_time, footer_line):\n"
+        "    _lark_completion_answer = response  # mirrors the split_gateway COMPLETE prefix\n"
         f"{_complete_body('    ')}"
-        "    return agent_result, response, _footer_line\n"
+        "    return agent_result, response, footer_line\n"
     )
     exec(compile(source, "<complete-hook-test>", "exec"), namespace)
     return namespace["complete"]

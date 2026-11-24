@@ -276,25 +276,21 @@ def inject_gateway(filename: str, content: str) -> str:
             )
         node = delivery_stmt[0]
         # Complete after transcript persistence and response rewrites (including context-reset
-        # notices), but before the native delivery decision. Strip only the footer we observed
-        # upstream append; CardKit renders its own footer from the structured usage fields.
-        # Silence must terminate an existing streaming session without rendering its marker.
+        # notices), but before the native delivery decision. Silence must terminate an existing
+        # streaming session without rendering its marker.
+        # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT_V2 (2026-11-24): v0.23.3 passes the footer as a
+        # `FooteredReply` wrapper / trailing send — the response text here never embeds the
+        # footer, so the old strip/append preamble had no source and its `_footer_line` /
+        # `_lark_footer_offset` / `_intentional_silence` references raised UnboundLocalError
+        # on every turn end (the recurring "Something went wrong" card). The new function's
+        # params are `footer_line` / `intentional_silence`; when the card lands we zero
+        # `footer_line` inside the completion body so the trailing footer send is suppressed.
         complete_body = p._complete_body("    ")
         prefix = textwrap.dedent("""
             _lark_completion_answer = response
-            _lark_footer_suffix = '\\n\\n' + _footer_line
-            if (_lark_footer_offset is not None
-                    and response[_lark_footer_offset:].startswith(_lark_footer_suffix)):
-                _lark_completion_answer = (response[:_lark_footer_offset]
-                    + response[_lark_footer_offset + len(_lark_footer_suffix):])
         """)
-        suffix = textwrap.dedent("""
-            if (_lark_footer_offset is None and _footer_line and response
-                    and not agent_result.get('already_sent') and not _intentional_silence):
-                response = f'{response}\\n\\n{_footer_line}'
-        """)
-        insert(node, block("COMPLETE", prefix + "if _intentional_silence:\n" + textwrap.indent(
-            p._abort_hook(""), "    ") + "else:\n" + complete_body + suffix))
+        insert(node, block("COMPLETE", prefix + "if intentional_silence:\n" + textwrap.indent(
+            p._abort_hook(""), "    ") + "else:\n" + complete_body))
 
     elif filename == "run_turn.py":
         # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): Hermes v0.23.0 split the
