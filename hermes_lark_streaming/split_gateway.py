@@ -10,7 +10,20 @@ import ast
 import textwrap
 from collections.abc import Callable, Iterator
 
-GATEWAY_FILES = ("run_inbound.py", "run_turn.py", "run_turn_runner.py", "run_busy.py")
+# SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): Hermes v0.23.0 split the
+# monolithic gateway/run_turn.py into four mixin modules. The delivery call
+# (`return await self._hmwa_deliver_turn_response(...)`) moved into
+# run_turn_persistence.py, so the completion hook has to be injected there.
+# Kept in GATEWAY_FILES so the patcher treats it as a first-class target.
+GATEWAY_FILES = (
+    "run_inbound.py",
+    "run_turn.py",
+    "run_turn_runner.py",
+    "run_busy.py",
+    "run_turn_persistence.py",
+    "run_background.py",
+    "run_turn_progress.py",
+)
 AGENT_FILES = ("chat_completion_helpers.py",)  # SAKUYA_PATCH_FALLBACK_CARD_RESET: agent 层清卡钩子
 
 
@@ -99,11 +112,27 @@ def inject_gateway(filename: str, content: str) -> str:
         for node in statement("_hm_admit_event", "source = event.source", 2):
             insert(node, p._feishu_normalize_hook, after=True)
         # This outer finally also covers preparation failures and cancellation.
-        restores = {ast.dump(ast.parse(source).body[0]) for source in (
+        # SAKUYA_PATCH_ANCHOR_MOA_RESTORE (2026-11-24): Hermes v0.23.0 removed
+        # `_restore_moa_one_shot` entirely and folded MoA one-shot restoration into
+        # `_restore_pending_one_turn_model_override`. Keeping the old anchor made the
+        # whole run_inbound.py injection fail (the upstream statement no longer exists,
+        # so select() found nothing). Anchor on the surviving statement instead, and
+        # accept either the old or new spelling so this survives further upstream moves.
+        restore_sources = (
             "self._restore_moa_one_shot(event, _quick_key)",
             "self._restore_pending_one_turn_model_override(_quick_key, _run_generation)",
-        )}
-        node = select("_handle_message", lambda n: isinstance(n, ast.Expr) and ast.dump(n) in restores)[0]
+        )
+        restores = {ast.dump(ast.parse(source).body[0]) for source in restore_sources}
+        candidates = select(
+            "_handle_message",
+            lambda n: isinstance(n, ast.Expr) and ast.dump(n) in restores,
+        )
+        if not candidates:
+            raise p.PatcherError(
+                f"{filename}: no one-turn restore statement found in _handle_message's finally "
+                f"(looked for {list(restore_sources)})"
+            )
+        node = candidates[0]
         inbound_handler = scope("_handle_message")
         if not isinstance(inbound_handler, (ast.FunctionDef, ast.AsyncFunctionDef)) or not any(
             isinstance(n, ast.Try) and node in n.finalbody for n in inbound_handler.body
@@ -115,7 +144,9 @@ def inject_gateway(filename: str, content: str) -> str:
         node = select("_busy_stop_command", lambda n: isinstance(n, ast.Return))[0]
         insert(node, p._stop_hook)
 
-    elif filename == "run_turn_runner.py":
+    elif filename == "run_turn_progress.py":
+        # SAKUYA_PATCH_ANCHOR_PROGRESS_SPLIT (2026-11-24): v0.23.0 moved
+        # `progress_callback` out of run_turn_runner.py into gateway/run_turn_progress.py.
         # After live status and native log recording, before the progress-queue gate.
         node = select("progress_callback", lambda n: isinstance(n, ast.If)
                       and ast.unparse(n.test) == "not ctx.progress_queue or not ctx._run_still_current()")[0]
@@ -127,9 +158,16 @@ def inject_gateway(filename: str, content: str) -> str:
                                    detail=preview or ''):
                     return
         """))
+
+    elif filename == "run_turn_runner.py":
         setup = "_setup_stream_consumer"
         # Keep native setup intact for disabled/unregistered turns and other platforms.
-        select(setup, lambda n: isinstance(n, ast.If) and ast.unparse(n.test) == "delta_sinks")
+        # SAKUYA_PATCH_ANCHOR_DELTA_SINKS (2026-11-24): v0.23.0 widened the guard
+        # from `if delta_sinks:` to `if delta_sinks or self._approval_owner is not None:`.
+        # Match on the leading `delta_sinks` name instead of the whole test expression
+        # so the anchor survives that rewrite.
+        select(setup, lambda n: isinstance(n, ast.If)
+               and ast.unparse(n.test).startswith("delta_sinks"))
         stream = scope("stream_delta_cb", scope(setup))
         if not any(isinstance(n, ast.Expr) and ast.unparse(n) == "sink.on_delta(text)"
                    for n in _scoped_nodes(stream)):
@@ -199,23 +237,44 @@ def inject_gateway(filename: str, content: str) -> str:
         )[0]
         insert(node, p._fallback_reset_hook, after=True)
 
-    else:
-        handler = "_handle_message_with_agent"
-        node = statement(handler, "event._heartbeat_execution_started = True")[0]
-        insert(node, p._start_hook, after=True)
-        node = statement(handler, "self._hmwa_discard_stale_result(source, _quick_key, run_generation)")[0]
-        insert(node, p._abort_hook)
-        node = assignment(handler, "_footer_line")
-        insert(node, block("COMPLETE", """
-            _lark_original_response = response
-            _lark_footer_offset = (
-                len(response) if _footer_line and response and not agent_result.get('already_sent')
-                and not _intentional_silence else None
+    elif filename == "run_background.py":
+        # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): v0.23.0 moved
+        # `_run_background_task_inner` (and the image/text extraction inside it) out of
+        # run_turn.py into gateway/run_background.py. Inject the background-delivery
+        # hook at its new home.
+        node = statement("_run_background_task_inner", "images, text_content = adapter.extract_images(response)")[0]
+        insert(node, p._bg_deliver_hook, after=True)
+
+    elif filename == "run_turn_persistence.py":
+        # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): the delivery call moved
+        # out of run_turn.py in v0.23.0. Inject the completion hook immediately
+        # before the native delivery decision, wherever that call now lives.
+        # Upstream also reshaped the call: it used to be `return await
+        # self._hmwa_deliver_turn_response(...)`, now it is
+        # `delivered = await self._hmwa_deliver_turn_response(...)` inside a new
+        # `_deliver_turn_response_then_limit_offer` helper. Match on the awaited
+        # call itself (any assignment/return form) and accept both helper names.
+        def is_delivery_call(n: ast.AST) -> bool:
+            if not isinstance(n, (ast.Assign, ast.Return, ast.Expr)):
+                return False
+            text = ast.unparse(n)
+            return "self._hmwa_deliver_turn_response(" in text and "await" in text
+
+        delivery_stmt = []
+        for owner in ("_deliver_turn_response_then_limit_offer", "_hmwa_persist_turn_transcript"):
+            try:
+                found = select(owner, is_delivery_call)
+            except p.PatcherError:
+                continue
+            if found:
+                delivery_stmt = found
+                break
+        if not delivery_stmt:
+            raise p.PatcherError(
+                f"{filename}: no awaited `_hmwa_deliver_turn_response` call found — "
+                f"the completion hook cannot be placed"
             )
-        """), after=True)
-        node = select(handler, lambda n: isinstance(n, ast.Return) and isinstance(n.value, ast.Await)
-                      and isinstance(n.value.value, ast.Call)
-                      and ast.unparse(n.value.value.func) == "self._hmwa_deliver_turn_response")[0]
+        node = delivery_stmt[0]
         # Complete after transcript persistence and response rewrites (including context-reset
         # notices), but before the native delivery decision. Strip only the footer we observed
         # upstream append; CardKit renders its own footer from the structured usage fields.
@@ -236,7 +295,52 @@ def inject_gateway(filename: str, content: str) -> str:
         """)
         insert(node, block("COMPLETE", prefix + "if _intentional_silence:\n" + textwrap.indent(
             p._abort_hook(""), "    ") + "else:\n" + complete_body + suffix))
-        node = statement(handler, "self._clear_session_env(_session_env_tokens)")[0]
+
+    elif filename == "run_turn.py":
+        # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): Hermes v0.23.0 split the
+        # monolithic gateway/run_turn.py into mixin modules. Anchors that stayed in
+        # run_turn.py (handler-level + first-response + queued-followup) are injected
+        # here; the delivery anchor moved to run_turn_persistence.py and the
+        # background-task anchor to run_background.py — those get their own branches.
+        handler = "_handle_message_with_agent"
+        node = statement(handler, "event._heartbeat_execution_started = True")[0]
+        insert(node, p._start_hook, after=True)
+        node = statement(handler, "self._hmwa_discard_stale_result(source, _quick_key, run_generation)")[0]
+        insert(node, p._abort_hook)
+        node = assignment(handler, "_footer_line")
+        insert(node, block("COMPLETE", """
+            _lark_original_response = response
+            _lark_footer_offset = (
+                len(response) if _footer_line and response and not agent_result.get('already_sent')
+                and not _intentional_silence else None
+            )
+        """), after=True)
+        # SAKUYA_PATCH_ANCHOR_CLEAR_ENV (2026-11-24): v0.23.0's mixin split left two
+        # `self._clear_session_env(_session_env_tokens)` statements inside
+        # `_handle_message_with_agent` — the heartbeat early-exit path and the
+        # finally-block cleanup. The abort hook belongs on the finally-block one
+        # (the cleanup that runs on every exit path). Anchor on the finally block
+        # instead of the bare statement so the count stays unambiguous.
+        clear_env = statement(handler, "self._clear_session_env(_session_env_tokens)", count=2)
+        finally_block = [
+            n for n in ast.walk(scope(handler))
+            if isinstance(n, ast.Try) and any(
+                ast.dump(c) in {ast.dump(x) for x in clear_env} for c in n.finalbody
+            )
+        ]
+        if len(finally_block) != 1:
+            raise p.PatcherError(
+                f"{filename}:{handler}: expected the session-env cleanup inside exactly one "
+                f"finally block, found {len(finally_block)}"
+            )
+        # Pick the cleanup that sits in the finally block (the one that runs on every
+        # exit path), not the heartbeat early-exit copy.
+        final_dumps = {ast.dump(c) for c in finally_block[0].finalbody}
+        node = next((c for c in clear_env if ast.dump(c) in final_dumps), None)
+        if node is None:
+            raise p.PatcherError(
+                f"{filename}:{handler}: session-env cleanup not found inside the finally block"
+            )
         insert(node, guarded("ABORT", """
             from hermes_lark_streaming.patch import on_message_aborted
             _lark_result = locals().get('agent_result')
@@ -244,8 +348,6 @@ def inject_gateway(filename: str, content: str) -> str:
                                 if isinstance(_lark_result, dict) else None) or event.message_id
             on_message_aborted(message_id=_lark_cleanup_id)
         """))
-        node = statement("_run_background_task_inner", "images, text_content = adapter.extract_images(response)")[0]
-        insert(node, p._bg_deliver_hook, after=True)
 
         first = "_run_agent_deliver_first_response"
         # Anchor on the stream-confirmed assignment specifically: later upstream revisions

@@ -629,11 +629,15 @@ class Patcher:
         from .split_gateway import AGENT_FILES, GATEWAY_FILES
 
         agent_dir = self.run_path.parent.parent / "agent"
-        return [
+        paths = [
             self.run_path,
             *(self.run_path.parent / name for name in GATEWAY_FILES),
             *(agent_dir / name for name in AGENT_FILES),  # SAKUYA_PATCH_FALLBACK_CARD_RESET
         ]
+        # SAKUYA_PATCH_ANCHOR_DELIVER_SPLIT (2026-11-24): v0.23.0 split the gateway
+        # into mixin modules; only keep the ones that actually exist in this install
+        # (older Hermes layouts don't have them).
+        return [p for p in paths if p.is_file()]
 
     def is_patched(self) -> bool:
         return any(
@@ -716,12 +720,19 @@ class CronPatcher:
         self.cron_path = delivery_path
 
     def is_patched(self) -> bool:
-        content = _read_source(self.cron_path)
-        return any(marker in content for pair in self.MARKERS for marker in pair)
+        return any(
+            marker in _read_source(path)
+            for path in self.target_paths
+            for marker in (m for pair in self.MARKERS for m in pair)
+        )
 
     def is_fully_patched(self) -> bool:
         try:
-            return _read_source(self.cron_path) == self.prepare_install()[self.cron_path]
+            prepared = self.prepare_install()
+            return all(
+                path.is_file() and _read_source(path) == content
+                for path, content in prepared.items()
+            )
         except (PatcherError, SyntaxError, OSError):
             return False
 
@@ -731,24 +742,42 @@ class CronPatcher:
     def apply(self) -> None:
         install_patchers([self])
 
+    @property
+    def target_paths(self) -> list[Path]:
+        # SAKUYA_PATCH_ANCHOR_CRON_SPLIT (2026-11-24): v0.23.0 split
+        # cron/scheduler_delivery.py; `_standalone_send` and its `_send` closure now
+        # live in scheduler_delivery_standalone.py. Both files carry one cron
+        # delivery lane, so both are patch targets.
+        paths = [self.cron_path]
+        standalone = self.cron_path.with_name("scheduler_delivery_standalone.py")
+        if standalone.is_file():
+            paths.append(standalone)
+        return paths
+
     def prepare_install(self) -> dict[Path, str]:
         from .split_cron import inject_cron
 
-        content = _clean_hooks(_read_source(self.cron_path), self.MARKERS)
-        updated = inject_cron(content)
-        compile(updated, str(self.cron_path), "exec")
-        return {self.cron_path: updated}
+        changes: dict[Path, str] = {}
+        for path in self.target_paths:
+            content = _clean_hooks(_read_source(path), self.MARKERS)
+            updated = inject_cron(content, path.name)
+            compile(updated, str(path), "exec")
+            changes[path] = updated
+        return changes
 
     def remove(self) -> None:
         _write_changes(self.prepare_remove())
 
     def prepare_remove(self) -> dict[Path, str]:
-        content = _clean_hooks(_read_source(self.cron_path), self.MARKERS)
-        compile(content, str(self.cron_path), "exec")
-        return {self.cron_path: content}
+        changes: dict[Path, str] = {}
+        for path in self.target_paths:
+            content = _clean_hooks(_read_source(path), self.MARKERS)
+            compile(content, str(path), "exec")
+            changes[path] = content
+        return changes
 
     def restore(self) -> None:
         _write_changes(self.prepare_restore())
 
     def prepare_restore(self) -> dict[Path, str]:
-        return _prepare_restore([self.cron_path], self.MARKERS)
+        return _prepare_restore(self.target_paths, self.MARKERS)
